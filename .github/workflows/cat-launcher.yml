@@ -1,0 +1,342 @@
+name: cat launcher
+on:
+  workflow_dispatch:
+    inputs:
+      arch:
+        description: "Arquitetura do APK"
+        required: true
+        default: "all"
+        type: choice
+        options: ["all", "arm64", "arm", "x86", "x86_64"]
+      build_type:
+        description: "Tipo de build"
+        required: true
+        default: "auto"
+        type: choice
+        options: ["auto", "debug", "release", "both"]
+  push:
+    branches: ["**"]
+permissions:
+  contents: read
+env:
+  REPORT_DIR: /tmp/zreport
+  SRC_ROOT: /home/runner/zalith-src
+  ARCH: ${{ github.event.inputs.arch || 'all' }}
+  BUILD_TYPE: ${{ github.event.inputs.build_type || 'auto' }}
+  UPSTREAM_REF: main
+jobs:
+  build:
+    name: Verificar, corrigir e compilar
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    defaults:
+      run:
+        shell: bash
+    env:
+      STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+      KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+      OAUTH_CLIENT_ID: ${{ secrets.OAUTH_CLIENT_ID }}
+      CURSEFORGE_API_KEY: ${{ secrets.CURSEFORGE_API_KEY }}
+    steps:
+      - name: Checkout do repositório
+        uses: actions/checkout@v6
+        with:
+          lfs: true
+      - name: Liberar espaço em disco e preparar relatório
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost || true
+          mkdir -p "$REPORT_DIR" "$SRC_ROOT"
+          : > "$REPORT_DIR/problems.txt"
+          : > "$REPORT_DIR/fixed.txt"
+      - name: "Verificação 1/4 - localizar e testar os arquivos ZIP"
+        run: |
+          set -uo pipefail
+          ZIPS=($(seq 1 17))
+          expected=${#ZIPS[@]}; found=0; ok=0
+          : > "$REPORT_DIR/zips.txt"
+          find_one() {
+            find "$GITHUB_WORKSPACE" -type f \( -iname "Cat$1.zip" -o -iname "Cat$(printf '%02d' "$1").zip" \) -not -path '*/.git/*' 2>/dev/null \
+              | awk '{ print length($0) "\t" $0 }' | sort -n | cut -f2-
+          }
+          for n in "${ZIPS[@]}"; do
+            mapfile -t hits < <(find_one "$n")
+            if [ "${#hits[@]}" -eq 0 ]; then
+              echo "::error::ZIP número $n ausente no repositório (esperado Cat$n.zip)"
+              continue
+            fi
+            found=$((found+1))
+            f="${hits[0]}"
+            size=$(stat -c %s "$f")
+            magic=$(head -c2 "$f" 2>/dev/null)
+            if [ "$size" -lt 1024 ] || [ "$magic" != "PK" ]; then
+              echo "::error::$f não é um ZIP válido (tamanho=$size)"
+              continue
+            fi
+            if ! unzip -tqq "$f" >/dev/null 2>&1; then
+              echo "::error::Falha no teste de integridade: $f"
+              continue
+            fi
+            echo "$f" >> "$REPORT_DIR/zips.txt"
+            ok=$((ok+1))
+          done
+          {
+            echo "ZIPS_EXPECTED=$expected"
+            echo "ZIPS_FOUND=$found"
+            echo "ZIPS_OK=$ok"
+          } >> "$GITHUB_ENV"
+          [ "$ok" -eq "$expected" ] || { echo "::error::Nem todos os ZIPs passaram na verificação."; exit 1; }
+      - name: "Verificação 2/4 - extrair para estrutura organizada e detectar conflitos"
+        run: |
+          set -uo pipefail
+          while IFS= read -r z; do
+            echo "Extraindo $z"
+            unzip -oq "$z" -d "$SRC_ROOT" || echo "::error::Falha ao extrair $z"
+          done < "$REPORT_DIR/zips.txt"
+          # se tudo veio dentro de uma única pasta raiz, sobe um nível
+          n=$(find "$SRC_ROOT" -mindepth 1 -maxdepth 1 | wc -l)
+          if [ "$n" -eq 1 ] && [ -d "$(find "$SRC_ROOT" -mindepth 1 -maxdepth 1)" ]; then
+            d=$(find "$SRC_ROOT" -mindepth 1 -maxdepth 1)
+            echo "Subindo conteúdo de $d"
+            shopt -s dotglob; mv "$d"/* "$SRC_ROOT"/; rmdir "$d"
+          fi
+          echo "Conteúdo de $SRC_ROOT:"; ls -la "$SRC_ROOT" | head -60
+      - name: "Completar arquivos faltantes a partir do repositório original"
+        run: |
+          set -eu
+          [ -d /tmp/upstream ] || git clone --depth 1 --branch "$UPSTREAM_REF" https://github.com/ZalithLauncher/ZalithLauncher2.git /tmp/upstream
+          if [ ! -f "$SRC_ROOT/settings.gradle.kts" ] && [ ! -f "$SRC_ROOT/settings.gradle" ]; then
+            echo "Raiz do Gradle ausente nos ZIPs; completando do repositório original (ref: $UPSTREAM_REF)."
+            for f in settings.gradle.kts build.gradle.kts gradle.properties gradlew gradlew.bat; do
+              if [ -f "/tmp/upstream/$f" ] && [ ! -f "$SRC_ROOT/$f" ]; then
+                cp "/tmp/upstream/$f" "$SRC_ROOT/$f"
+                echo "Completado da raiz original: $f"
+              fi
+            done
+            if [ -d /tmp/upstream/gradle ] && [ ! -d "$SRC_ROOT/gradle" ]; then
+              cp -r /tmp/upstream/gradle "$SRC_ROOT/gradle"
+              echo "Completado da raiz original: pasta gradle/"
+            fi
+            if [ -f "$SRC_ROOT/gradlew" ]; then chmod +x "$SRC_ROOT/gradlew"; fi
+          fi
+          added=0
+          for m in ZalithLauncher Guide InputMap ColorPicker CardGrid LayerController Terracotta PetLib; do
+            U="/tmp/upstream/$m/src/main/res"
+            D="$SRC_ROOT/$m/src/main/res"
+            if [ ! -d "$U" ] || [ ! -d "$SRC_ROOT/$m" ]; then continue; fi
+            while IFS= read -r f; do
+              if [ ! -e "$D/$f" ]; then
+                mkdir -p "$(dirname "$D/$f")"
+                cp "$U/$f" "$D/$f"
+                echo "Recurso completado: $m/src/main/res/$f"
+                added=$((added+1))
+              fi
+            done < <(cd "$U" && find . -type f | sed 's|^\./||')
+          done
+      - name: "Verificação 3/4 - identificar a estrutura real do projeto Android"
+        run: |
+          base64 -d <<'B64' | gunzip | python3 -
+          H4sIAAAAAAACA51Y607jShL+76dotVbCZsDA/NlzzMlBnIHDcCCAAjNaKcmJOnE7GHyT2wkZZfIwq/2xDzCPwIvtV93txAlZ9hKJxF2uqq6q/urSxGmRlxXL1R4r5R5T3/AwTvKho8oRa4Huy2wal3nW5fedT4PO7e0D7x+Dt9h42zm/u+08DM4uO7zv3F9d3uH9nA8ncRLyPcb9cSnCRJrHuKLfLA/lIM3DSSKVpo9mM/qtRDmWFV84oYzYi0ie3aFQ0gschk+UlyzcYyHMjBSLM7Jhk4c+oeoGfZjQnWmR
+          GbGGEIjwmOUVLcnI/lLgWyyTkFRHyhmJDLwQ7jt2P7OX3giBadiSEd3lSlZVnI2VddN/rrRLG2TeMBCWaNlIBUzv54uikFnouqE/yidZ5cIzJQtvj1wsRPXoP+Vx5sKYzPM8h+ThhxY1WosyhhQPAlmWeRkENzJ7nKRswwaXbPOYzEZ5VoGSM1G8/lBMMDnD+vWfr//Ife4dExR8OYsr98gzAfEVkOLSG6sREdIvuof97hFAUZT5k0GFNjeMy0yk0q3Ztc2JzFwt5LFf2dGG4XAoHskg+Pr69zLO1abpDaPV
+          MZsoqMlZzlIRK1YKlQcI+Wozq/Wuc/vH+ScNTNYCAxnpaWiVUoRuYY+klNWkBJpwBG6xp3cKoafFJ1W0/xPkdFBVi8fjLC9xkr4W9xxVIW7wWi8buyMCDQglcSbptDW3r4okroikXLs9sRLBV1UZF1BrIVJKPxXV6NEteZyNkkkoe0PysgEks9MHssCP4iwUSQJuzrt8p+8GJ90/8fvBoxWIJLqyraAtCuwpykq9xNUjDoEDG4mSDE/sAys0yAsyXUv1nXyKSMShJAXzxX/lXKrDAzCLUnvCOR2CHFU9t6d2
+          jZ0NM0HreT3f8pzFJQgtf/dEM27yneD7L9qxZviW8UsDtjS4mwJH+aQAoKky1KuPnmOL0Moj7XAYjyo/KvP0WX5Trna/dsjwdwvSs9Tvo2oRdgprBcUSKCkSMZK0QD044F4NzIinrz+gBjAP5SgRGtUBm1OCWP3egnsOqoKG0TFLY6UArhWoCqrZCZlqBfy4kuky7GEjF3XpoIhqEROeYUSqIn3CkSljulxv1LAmDeBAUGulsYpiFJTN8hR5Xr+OP5WoFTsqght6jMom6MNoBWLrW10DIz4vFmz/VzaHtQuq
+          RjabGfv99PrhlPLYeHLMqCTE2URqXctM3DRqGKFKWVw8I0vAx7EZt0m2xOYoT3s+CkuZx2GPzEnikajiPPu+jQg7KpsvvaUv+PAkHv4H1eAoRfnt+yahoZI/TdODfFKVOa/jaUy3tgco3cWybZiAvO0W1nOvUWojxHFeBB9/Ugsd4eDjIT2RcoIc5Y05D3NAuijiSIDlxQFANEyAMr+a6S4uAPKXEsBzebsGtJIpsgcl9fUH6viBRhAjrASMigo/RrPX5tltPCL2Mu5t7WPtt3mCmo+ONVEyq6SizKoVrbct
+          C0BE6N0OaRMRSEpZkUzGSAU81kfVPO83jdF2NLCYfrba4kWUGUUwaFN7CiVrbNTQWPcx+AAqdVIcFiX9gA5REwcIpXkwgWxZTsfk5Mv2NOf2LYL6UrzLcvBSEobKA7Pct0sqwPipYkxn0PH0f+l4EiWEdZMQQ0KnKTTu0jpMm+YJc05N3WbBHnsptrHQBnj35Nmi96bm6BIVNfulTYElCubatEWNJwbwzsm5xeZhj6cbjcza4nYP93/u05ff3/X2+Z4pQTAYCrTQeLpsPWQhaCbBT7gjxnQ6N3kmnSpPk/ej
+          jBqhfPQbBeQgA8Fv0nXDXXqxvffu/In9qJ/ij1MzRS/lO9ZgLUbPfhuGG8NSBnSyVedc5tS4WBvIGwOynrBW8V62l0gFzRpJgYjWZo/1TrPOvG2OWC+oVZ4nqudrJYFRErjmUODj3va2ENWFccMwzA3W/5XnqaAcSEQ6DAWbBoxg1JjPeuEH7DKl7sYPURSN3KFHgnE2eAqfIf3xiLS7UOWOpygZLfYzCdAa+xmCrf5Hf3XIJQhhqnQ9591Abw3y/xRgvdd3TEDk1sxb3ZrWxso/xFRci2w8EWP51eCw5+dR
+          z3Xhvtd7N84LBzGgIYvuEZLghh332bwOz4LaQLde9XURbA7XywroOZkOZhPXoNT2vEV3rQlHsUXuN9JJw+QcX2S11UCp1HOXenpeQ5POknvPeRRqUE4U2TiEOy5dnX36crdl8e7uwSdcbnObuaRkNIHRU9l6KCcSUBlllb43P1fo7ocQeULA7eMMMuaplIqagqLl4n1gNIoD3ZD1hQwjGI0Q0MJ1dnNcabmeeHEVzaruSn+f7hVH/x5hEsZGfqlHfpf7OP0jr7t/1G9CUF8NoNbollZlXYWvcrortOb0bue5
+          2ukvGGHMEsh7Iv2tfW0pCAIRCgFc49YnlaXXJuOlKYnaEYSxT74eUpJpCgXRkLaPBHd066hyPcIY2w6wOWAqMdRPcEcUjK42aD0iFG/GgVRk2wv4so1TrA8I4wenpnC1RRZHUO7P6mK+pX9Br7fd3i1amL7TF3U/0+MR5NctreN/oYtBaz6eLtjpxV1rjjKEIzi70juN4kIkrVWG6ioxesQScW+ksb6p1CrbqykH95l6lFkwd26jgET/zm7OrlpzymNCIH6XdXaBl1jv61TH3oYjXWfoIOda8zr7aHeZUaOd
+          6yA1L/08YDb7Tu/uBnenD5/N3GznK001bPUZGRUXndOz6/PB1/PO/eXtDV6Pp8R9cdcgUYugcn9CgzBiNmifXhIdUHHrmHlWH/xtSDYd1jMLAmFGAlL1+fR+0Ply/2BV1W56fpK/yNJtqmxf1T6l6xrTlULD3b49+wKHPt1+uakVN++aULpwqE2Ycb/5r72Ly4fPX34bnN985X0z8TPk3njVeZ6p7yHLIbG8grKxvRbg4vC8aM2ni+WAX7/RIbu+vH/45ZfB4Pz298EALPYqYJKHjHwyveiJNqAGYi8LKwnP
+          +RdzGZ//xRQAAA==
+          B64
+      - name: "Verificação 4/4 - correção automática"
+        run: |
+          set -uo pipefail
+          cd "${PROJECT_DIR:?}" && : "${APP_DIR:?}"
+          chmod +x gradlew
+          cat > /tmp/gb.sh <<'S'
+          cd "$PROJECT_DIR"
+          e() { grep -E '^e: ' "$REPORT_DIR/build-$2.log" | head -15; grep -A14 -m1 "What went wrong" "$REPORT_DIR/build-$2.log" | head -16; }
+          f() { e "$@"; echo "::error title=Falha em $1::$(e "$@" | sed ':a;N;$!ba;s/\n/%0A/g')"; }
+          for i in 1 2 3 4 5; do
+            if ./gradlew "${APP_PATH}:$1" -I /tmp/oi.gradle --no-daemon -q --console=plain > "$REPORT_DIR/build-$2.log" 2>&1; then echo "Build $1 OK"; exit 0; fi
+            c=0
+            while read -r p l k n; do
+              [ "$n" = weight ] && { sed -i -E "${l}s/\.weight\([^)]*\)//" "$p"; c=1; continue; }
+              s=$(sed -n "${l}p" "$p"); r=$(echo "${s:0:$((k-1))}" | grep -oE '(drawable|mipmap|string)\.$' | cut -d. -f1)
+              if [ "$r" = string ]; then
+                X="$APP_DIR/src/main/res/values/zz_missing.xml"
+                [ -f "$X" ] || printf '<resources>\n</resources>\n' > "$X"
+                grep -q "\"$n\"" "$X" || { sed -i "s#</resources>#<string name=\"$n\">${n//_/ }</string>\n</resources>#" "$X"; c=1; echo "String criada: $n"; }
+                continue
+              fi
+              [ -n "$r" ] || { echo "SEM PADRAO: ${s:0:100}"; continue; }
+              mkdir -p "$APP_DIR/src/main/res/$r"
+              echo '<vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="48dp" android:height="48dp" android:viewportWidth="48" android:viewportHeight="48"><path android:fillColor="#888" android:pathData="M24,24m-20,0a20,20 0 1,1 40,0a20,20 0 1,1 -40,0"/></vector>' > "$APP_DIR/src/main/res/$r/$n.xml"
+              c=1; echo "Placeholder criado: $r/$n"
+            done < <(sed -nE "s#^e: file://([^:]+):([0-9]+):([0-9]+) Unresolved reference '([A-Za-z0-9_]+)'.*#\1 \2 \3 \4#p" "$REPORT_DIR/build-$2.log" | sort -u)
+            [ "$c" = 1 ] || { f "$@"; exit 1; }
+          done
+          f "$@"; exit 1
+          S
+          cat > /tmp/oi.gradle <<'O'
+          allprojects { tasks.matching { it.class.name.contains('KotlinCompile') }.configureEach { t ->
+            try {
+              t.compilerOptions.optIn.addAll([
+                'androidx.compose.material3.ExperimentalMaterial3Api',
+                'androidx.compose.material3.ExperimentalMaterial3ExpressiveApi',
+                'androidx.compose.foundation.ExperimentalFoundationApi',
+                'androidx.compose.foundation.layout.ExperimentalLayoutApi',
+                'androidx.compose.animation.ExperimentalAnimationApi',
+                'androidx.compose.ui.ExperimentalComposeUiApi',
+                'androidx.compose.animation.ExperimentalSharedTransitionApi'
+              ])
+            } catch (e) {}
+          } }
+          O
+      - name: Adicionar Java 21 e 25 ao projeto
+        run: |
+          set -eu
+          A=$(find "$SRC_ROOT" -type d -path "*/src/main/assets/runtimes" | sort | head -1)
+          [ -n "$A" ] || { echo "::error::assets/runtimes nao encontrada"; exit 1; }
+          mkdir -p "$A/jre-21" "$A/jre-25"
+          W="$GITHUB_WORKSPACE"
+          [ -f "$W/jre-21-universal.tar.xz" ] || { echo "::error::jre-21-universal.tar.xz ausente na raiz"; exit 1; }
+          cp "$W/jre-21-universal.tar.xz" "$A/jre-21/universal.tar.xz"
+          if [ -f "$W/jre-25-universal.tar.xz" ]; then
+            cp "$W/jre-25-universal.tar.xz" "$A/jre-25/universal.tar.xz"
+          else
+            ls "$W"/jre-25-universal.tar.xz.part* >/dev/null || { echo "::error::jre-25 (ou .part00/.part01) ausente na raiz"; exit 1; }
+            cat "$W"/jre-25-universal.tar.xz.part* > "$A/jre-25/universal.tar.xz"
+          fi
+          xz -t "$A/jre-21/universal.tar.xz" "$A/jre-25/universal.tar.xz"
+          ls -l "$A/jre-21" "$A/jre-25"
+      - name: Instalar JDKs necessários
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JDK_LIST }}
+      - name: Instalar Android SDK
+        run: |
+          export ANDROID_HOME="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          B="$ANDROID_HOME/cmdline-tools/latest/bin"
+          if [ ! -x "$B/sdkmanager" ]; then
+            curl -fsSL -o /tmp/ct.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+            unzip -q /tmp/ct.zip -d /tmp/ct && mkdir -p "$ANDROID_HOME/cmdline-tools" && mv /tmp/ct/cmdline-tools "$ANDROID_HOME/cmdline-tools/latest"
+          fi
+          echo "$B" >> "$GITHUB_PATH"
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
+          yes | "$B/sdkmanager" --licenses >/dev/null 2>&1 || true
+      - name: Instalar NDK
+        if: env.NDK_VERSION != ''
+        run: |
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager "ndk;${NDK_VERSION}" 2>&1 | tee "$REPORT_DIR/ndk.log"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+      - name: Instalar Rust (se o projeto usar)
+        if: env.HAS_RUST == 'true'
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android
+          cargo install cargo-ndk --locked 2>&1 | tail -n 5
+      - name: Configurar Gradle
+        uses: gradle/actions/setup-gradle@v4
+      - name: Decidir tipos de build
+        run: |
+          s=false; [ -n "${STORE_PASSWORD:-}" ] && [ -n "${KEY_PASSWORD:-}" ] && s=true
+          d=true; r=false
+          case "$BUILD_TYPE" in
+            debug) ;;
+            release) d=false; r=true ;;
+            both) r=true ;;
+            *) r=$s ;;
+          esac
+          if [ "$r" = true ] && [ "$s" != true ]; then
+            r=false
+          fi
+          echo "BUILD_DEBUG=$d" >> "$GITHUB_ENV"; echo "BUILD_RELEASE=$r" >> "$GITHUB_ENV"
+      - name: Trocar nome e ícone do app (Cat Launcher)
+        run: |
+          cd "$PROJECT_DIR"; P="$APP_DIR/gradle.properties"; touch "$P"
+          sed -i -E '/^launcher_(app_)?name=/d' "$P"
+          printf '\nlauncher_app_name=Cat Launcher\nlauncher_name=Cat Launcher\n' >> "$P"
+          python3 - <<'P'
+          import zlib,struct,os,glob
+          R=os.path.join(os.environ["PROJECT_DIR"],os.environ["APP_DIR"],"src/main/res")+"/"
+          C=dict(O="E8923A",D="B0621C",W="F5EBDD",G="5CC84A",B="1B1B1B",P="E58A9A")
+          H="........ ........ ..DD.... ..DOD... ..DOOOOD ..DOODOO ..DOOOOO ..DOBGGO ..DOOBBO ..DOOOOP ..DOWWOP ..DOWWWB ..DDOWWW ...DDOOO ....DDDD ........".split()
+          G=[[bytes.fromhex(C.get(c,"2B1B4D")) for c in h+h[::-1]] for h in H]
+          def png(s):
+           w=lambda t,d:struct.pack(">I",len(d))+t+d+struct.pack(">I",zlib.crc32(t+d))
+           r=b"".join(b"\0"+b"".join(G[y*16//s][x*16//s] for x in range(s)) for y in range(s))
+           return b"\x89PNG\r\n\x1a\n"+w(b"IHDR",struct.pack(">IIBBBBB",s,s,8,2,0,0,0))+w(b"IDAT",zlib.compress(r))+w(b"IEND",b"")
+          P=os.environ["PROJECT_DIR"]+"/**/src/*/res/"
+          for f in glob.glob(P+"mipmap-*/ic_launcher*",recursive=True)+glob.glob(P+"drawable*/ic_launcher_foreground.*",recursive=True): os.remove(f); print("removido",f)
+          os.makedirs(R+"drawable-nodpi",exist_ok=True); open(R+"drawable-nodpi/ic_launcher_foreground.png","wb").write(png(192))
+          for d,s in dict(mdpi=48,hdpi=72,xhdpi=96,xxhdpi=144,xxxhdpi=192).items():
+           os.makedirs(R+"mipmap-"+d,exist_ok=True)
+           for n in ("ic_launcher","ic_launcher_round"): open(f"{R}mipmap-{d}/{n}.png","wb").write(png(s))
+          print("icones criados em",R,len(glob.glob(R+"mipmap-*/ic_launcher.png")))
+          P
+      - name: Criar keystore de debug ausente
+        run: |
+          cd "$PROJECT_DIR"
+          F="$APP_DIR/zalith_launcher_debug.jks"
+          if [ ! -f "$F" ]; then
+            keytool -genkeypair -v -keystore "$F" -storetype JKS \
+              -alias androiddebugkey -storepass android -keypass android \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+          fi
+      - name: Corrigir import kotlinx.coroutines.cancel (FastStartupLoader)
+        run: |
+          F=$(find "$SRC_ROOT" -type f -name FastStartupLoader.kt | head -1)
+          if [ -n "$F" ] && ! grep -q '^import kotlinx.coroutines.cancel$' "$F"; then
+            sed -i '0,/^import /s//import kotlinx.coroutines.cancel\nimport /' "$F"
+            echo "Import adicionado em $F"
+            grep -n 'import kotlinx.coroutines' "$F"
+          fi
+      - name: Compilar Debug
+        if: env.BUILD_DEBUG == 'true'
+        run: |
+          cd "$PROJECT_DIR"
+          bash /tmp/gb.sh assembleDebug debug
+      - name: Compilar Release
+        if: env.BUILD_RELEASE == 'true'
+        run: |
+          cd "$PROJECT_DIR"
+          bash /tmp/gb.sh assembleRelease release
+      - name: Coletar APKs
+        if: always()
+        run: |
+          set +e +o pipefail
+          mkdir -p /tmp/apks
+          P="$PROJECT_DIR"
+          if [ -z "$P" ]; then P=.; fi
+          find "$P" -type f -name '*.apk' -path '*/build/outputs/apk/*' 2>/dev/null > /tmp/apklist.txt
+          while read -r f; do
+            [ -n "$f" ] || continue
+            name=$(basename "$f")
+            if [ "$ARCH" != "all" ]; then
+              case "$name" in
+                *"$ARCH"*|*universal*) ;;
+                *) continue ;;
+              esac
+            fi
+            cp "$f" "/tmp/apks/$name"
+          done < /tmp/apklist.txt
+          ls -lh /tmp/apks
+          for f in /tmp/apks/*.apk; do "$(ls -d $ANDROID_HOME/build-tools/*/ | tail -1)aapt2" dump badging "$f" | grep "^application:"; done
+          if [ -z "$(ls -A /tmp/apks 2>/dev/null)" ]; then
+            echo "::warning::Nenhum APK gerado."
+          fi
+          exit 0
+      - name: Publicar APKs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Cat Launcher
+          path: /tmp/apks/*.apk
+          if-no-files-found: warn
+
+          
