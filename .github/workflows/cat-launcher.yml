@@ -52,36 +52,50 @@ jobs:
         run: |
           ls -la "$GITHUB_WORKSPACE"
           find "$GITHUB_WORKSPACE" -iname 'ehsb.zip*' -not -path '*/.git/*' | sort -V
-      - name: "Verificação 1/4 - localizar, juntar e testar o ZIP dividido (ehsb.zip.NN)"
+      - name: "Verificação 1/4 - juntar ehsb.zip.NN / ehsb.zip.tNN, extrair e testar Cat1..Cat17"
         run: |
           set -uo pipefail
           EXPECTED=17
           : > "$REPORT_DIR/zips.txt"
+          # aceita ehsb.zip.04 e ehsb.zip.t01 (com ou sem o "t"), ordenando pelo número
           mapfile -t parts < <(
-            find "$GITHUB_WORKSPACE" -type f -iregex '.*/ehsb\.zip\.[0-9]+' -not -path '*/.git/*' 2>/dev/null \
-              | awk -F/ '{ print $NF "\t" $0 }' | sort -V | cut -f2-
+            find "$GITHUB_WORKSPACE" -type f -iregex '.*/ehsb\.zip\.t?[0-9]+' -not -path '*/.git/*' 2>/dev/null \
+              | awk -F. '{ n=$NF; sub(/^[tT]/,"",n); print n+0 "\t" $0 }' | sort -n | cut -f2-
           )
           found=${#parts[@]}
           echo "Partes encontradas: $found"
           printf '%s\n' "${parts[@]}"
           if [ "$found" -ne "$EXPECTED" ]; then
-            echo "::error::Esperava $EXPECTED partes (ehsb.zip.01 a ehsb.zip.$EXPECTED), encontrei $found"
+            echo "::error::Esperava $EXPECTED partes do ehsb.zip, encontrei $found"
             exit 1
           fi
           for p in "${parts[@]}"; do
-            [ "$(stat -c %s "$p")" -gt 0 ] || { echo "::error::Parte vazia ou ponteiro LFS: $p"; exit 1; }
+            [ "$(stat -c %s "$p")" -gt 1024 ] || { echo "::error::Parte vazia ou ponteiro LFS: $p"; exit 1; }
           done
           cat "${parts[@]}" > /tmp/ehsb.zip
           if [ "$(head -c2 /tmp/ehsb.zip)" != "PK" ] || ! unzip -tqq /tmp/ehsb.zip >/dev/null 2>&1; then
-            echo "::error::ehsb.zip montado está inválido (confira a ordem ou partes faltando)"
+            echo "::error::ehsb.zip montado está inválido (confira as partes)"
             exit 1
           fi
-          echo /tmp/ehsb.zip >> "$REPORT_DIR/zips.txt"
+          # o ehsb.zip contém Cat1.zip ... Cat17.zip
+          mkdir -p /tmp/cats && unzip -oq /tmp/ehsb.zip -d /tmp/cats
+          found=0; ok=0
+          for n in $(seq 1 $EXPECTED); do
+            f=$(find /tmp/cats -type f -iname "Cat$n.zip" | head -1)
+            if [ -z "$f" ]; then echo "::error::Cat$n.zip ausente dentro do ehsb.zip"; continue; fi
+            found=$((found+1))
+            if unzip -tqq "$f" >/dev/null 2>&1; then
+              echo "$f" >> "$REPORT_DIR/zips.txt"; ok=$((ok+1))
+            else
+              echo "::error::Cat$n.zip corrompido"
+            fi
+          done
           {
-            echo "ZIPS_EXPECTED=1"
-            echo "ZIPS_FOUND=1"
-            echo "ZIPS_OK=1"
+            echo "ZIPS_EXPECTED=$EXPECTED"
+            echo "ZIPS_FOUND=$found"
+            echo "ZIPS_OK=$ok"
           } >> "$GITHUB_ENV"
+          [ "$ok" -eq "$EXPECTED" ] || { echo "::error::Nem todos os Cat*.zip passaram na verificação."; exit 1; }
       - name: "Verificação 2/4 - extrair para estrutura organizada e detectar conflitos"
         run: |
           set -uo pipefail
