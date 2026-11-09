@@ -48,43 +48,40 @@ jobs:
           mkdir -p "$REPORT_DIR" "$SRC_ROOT"
           : > "$REPORT_DIR/problems.txt"
           : > "$REPORT_DIR/fixed.txt"
-      - name: "Verificação 1/4 - localizar e testar os arquivos ZIP"
+      - name: Listar arquivos do repositório (diagnóstico)
+        run: |
+          ls -la "$GITHUB_WORKSPACE"
+          find "$GITHUB_WORKSPACE" -iname 'ehsb.zip*' -not -path '*/.git/*' | sort -V
+      - name: "Verificação 1/4 - localizar, juntar e testar o ZIP dividido (ehsb.zip.NN)"
         run: |
           set -uo pipefail
-          ZIPS=($(seq 1 17))
-          expected=${#ZIPS[@]}; found=0; ok=0
+          EXPECTED=17
           : > "$REPORT_DIR/zips.txt"
-          find_one() {
-            find "$GITHUB_WORKSPACE" -type f \( -iname "Cat$1.zip" -o -iname "Cat$(printf '%02d' "$1").zip" \) -not -path '*/.git/*' 2>/dev/null \
-              | awk '{ print length($0) "\t" $0 }' | sort -n | cut -f2-
-          }
-          for n in "${ZIPS[@]}"; do
-            mapfile -t hits < <(find_one "$n")
-            if [ "${#hits[@]}" -eq 0 ]; then
-              echo "::error::ZIP número $n ausente no repositório (esperado Cat$n.zip)"
-              continue
-            fi
-            found=$((found+1))
-            f="${hits[0]}"
-            size=$(stat -c %s "$f")
-            magic=$(head -c2 "$f" 2>/dev/null)
-            if [ "$size" -lt 1024 ] || [ "$magic" != "PK" ]; then
-              echo "::error::$f não é um ZIP válido (tamanho=$size)"
-              continue
-            fi
-            if ! unzip -tqq "$f" >/dev/null 2>&1; then
-              echo "::error::Falha no teste de integridade: $f"
-              continue
-            fi
-            echo "$f" >> "$REPORT_DIR/zips.txt"
-            ok=$((ok+1))
+          mapfile -t parts < <(
+            find "$GITHUB_WORKSPACE" -type f -iregex '.*/ehsb\.zip\.[0-9]+' -not -path '*/.git/*' 2>/dev/null \
+              | awk -F/ '{ print $NF "\t" $0 }' | sort -V | cut -f2-
+          )
+          found=${#parts[@]}
+          echo "Partes encontradas: $found"
+          printf '%s\n' "${parts[@]}"
+          if [ "$found" -ne "$EXPECTED" ]; then
+            echo "::error::Esperava $EXPECTED partes (ehsb.zip.01 a ehsb.zip.$EXPECTED), encontrei $found"
+            exit 1
+          fi
+          for p in "${parts[@]}"; do
+            [ "$(stat -c %s "$p")" -gt 0 ] || { echo "::error::Parte vazia ou ponteiro LFS: $p"; exit 1; }
           done
+          cat "${parts[@]}" > /tmp/ehsb.zip
+          if [ "$(head -c2 /tmp/ehsb.zip)" != "PK" ] || ! unzip -tqq /tmp/ehsb.zip >/dev/null 2>&1; then
+            echo "::error::ehsb.zip montado está inválido (confira a ordem ou partes faltando)"
+            exit 1
+          fi
+          echo /tmp/ehsb.zip >> "$REPORT_DIR/zips.txt"
           {
-            echo "ZIPS_EXPECTED=$expected"
-            echo "ZIPS_FOUND=$found"
-            echo "ZIPS_OK=$ok"
+            echo "ZIPS_EXPECTED=1"
+            echo "ZIPS_FOUND=1"
+            echo "ZIPS_OK=1"
           } >> "$GITHUB_ENV"
-          [ "$ok" -eq "$expected" ] || { echo "::error::Nem todos os ZIPs passaram na verificação."; exit 1; }
       - name: "Verificação 2/4 - extrair para estrutura organizada e detectar conflitos"
         run: |
           set -uo pipefail
@@ -338,5 +335,4 @@ jobs:
           name: Cat Launcher
           path: /tmp/apks/*.apk
           if-no-files-found: warn
-
           
